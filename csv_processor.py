@@ -13,8 +13,8 @@ class StreamlitRamanSpectrumProcessor:
         """
         self.laser_wavelength = laser_wavelength
         # Default standard Raman peaks of ethanol (cm⁻¹)
-        self.default_pixel_indexs = [200, 400, 600, 800, 1000, 1200, 1400]
-        self.default_ethanol_peaks = [2973, 2927, 2876, 1455, 1097, 1063, 884]
+        self.default_pixel_indexs = [200, 400, 600, 800, 1000, 1200, 1400, 1600, 1400, 1800]
+        self.default_ethanol_peaks = [2973, 2927, 2876, 1455, 1277, 1097, 1063, 880, 434, 0]
         self.pixel_indexs = self.default_pixel_indexs
         
     def wavenumber_to_wavelength(self, wavenumber):
