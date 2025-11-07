@@ -15,7 +15,7 @@ st.set_page_config(
 
 st.title("ラマンピークキャリブレーション")
 st.markdown("エタノールを用いてピーク位置と波数をキャリブレーションします")
-st.header("📁 データ入力")
+st.header("データ入力")
 uploaded_file = st.file_uploader("CSVファイルをアップロード", type=['csv'], help="ラマンスペクトルのCSVをアップロードしてください")
 
 # ------------------------------------------------------------
@@ -192,9 +192,6 @@ with st.sidebar:
     laser_wavelength = st.selectbox("レーザー波長 (nm)", options=[532, 785, 830], index=0)
     processor.laser_wavelength = laser_wavelength
     
-    # st.header("📁 データ入力")
-    # uploaded_file = st.file_uploader("CSVファイルをアップロード", type=['csv'], help="ラマンスペクトルのCSVをアップロードしてください")
-
     # -------------------------------
     # 自動ピーク検出（サイドバー）
     # -------------------------------
@@ -209,8 +206,6 @@ with st.sidebar:
         default_k = 10  # 既定ピークリストの長さに合わせて10を推奨
         top_k = st.number_input("反映するピーク数(上位prominence順)", min_value=1, max_value=200, value=int(default_k), step=1, key="auto_top_k")
 
-        # st.button("🔍 検出を実行", key="btn_run_detect_sidebar")
-
 
 # Main content area
 if uploaded_file is not None:
@@ -219,37 +214,24 @@ if uploaded_file is not None:
     if pixel_index is not None and spectrum_data is not None:
         st.success(f"✅ データを読み込みました！ {len(pixel_index)} 点")
 
-        # ▼ 追加：ロック集合の初期化
+        # ▼ ロック集合の初期化
         if "locked_pixels" not in st.session_state:
             st.session_state["locked_pixels"] = set()
         if "locked_wavenumbers" not in st.session_state:
             st.session_state["locked_wavenumbers"] = set()
 
-        # ファイルが切り替わったら検出/手動/除外/適用状態を初期化
+        # ファイル切替時の初期化
         if st.session_state.get("last_uploaded_name") != uploaded_file.name:
             st.session_state["manual_peaks_idx"] = []        # 手動追加（インデックス）
             st.session_state["excluded_auto_peaks"] = set()  # 自動検出からの除外（インデックス）
             for k in ["auto_peaks_idx", "auto_peaks_prom", "auto_d2",
                       "peaks_applied", "matched_pixels", "matched_wavenumbers", "peak_rois"]:
                 st.session_state.pop(k, None)
-            # ▼ ロックもリセット
             st.session_state["locked_pixels"] = set()
             st.session_state["locked_wavenumbers"] = set()
             st.session_state["last_uploaded_name"] = uploaded_file.name
-        # サイドバーのボタンで検出
-        # if st.session_state.get("btn_run_detect_sidebar"):
-        #     det_idx, d2, det_prom = detect_peaks_sd_prom(
-        #         pixel_index=pixel_index,
-        #         spectrum=spectrum_data,
-        #         smooth_win=st.session_state.get("auto_smooth_win", 11),
-        #         deriv_thresh=st.session_state.get("auto_deriv_thresh", 20.0),
-        #         prom_thresh=st.session_state.get("auto_prom_thresh", 10.0),
-        #         min_distance=st.session_state.get("auto_min_distance", 20),
-        #     )
-        #     st.session_state["auto_peaks_idx"] = det_idx
-        #     st.session_state["auto_peaks_prom"] = det_prom
-        #     st.session_state["auto_d2"] = d2
-        # 新（アップロード直後やパラメータ変更で毎回自動実行されます）:
+
+        # 自動検出は毎回実行（設定変更に追従）
         det_idx, d2, det_prom = detect_peaks_sd_prom(
             pixel_index=pixel_index,
             spectrum=spectrum_data,
@@ -261,6 +243,7 @@ if uploaded_file is not None:
         st.session_state["auto_peaks_idx"] = det_idx
         st.session_state["auto_peaks_prom"] = det_prom
         st.session_state["auto_d2"] = d2
+
         # --------------------------------------------------
         # 検出結果の表示＋手動制御（「適用」まではここだけ表示）
         # --------------------------------------------------
@@ -272,7 +255,7 @@ if uploaded_file is not None:
             if det_idx.size == 0:
                 st.warning("ピークが見つかりません。閾値を下げるか、ウィンドウ/間隔を調整してください。")
             else:
-                # prominence 降順で並べ替え → 上位K抽出 → x昇順
+                # prominence降順→上位K→x昇順
                 if det_prom.size == det_idx.size and det_prom.size > 0:
                     order = np.argsort(det_prom)[::-1]
                     det_idx_sorted = det_idx[order]
@@ -295,9 +278,7 @@ if uploaded_file is not None:
                     st.session_state["manual_peaks_idx"] = []
                 excluded = st.session_state["excluded_auto_peaks"]
 
-                # ============================
                 # レイアウト：左（広）／右（狭）
-                # ============================
                 col_plot, col_ctrl = st.columns([4, 1])
 
                 # ---- 左：グラフ（上：原スペクトル, 下：-2次微分） ----
@@ -356,20 +337,20 @@ if uploaded_file is not None:
                     fig_auto.update_layout(height=620, showlegend=True)
                     st.plotly_chart(fig_auto, use_container_width=True)
 
-                    # ↓↓↓ グラフ直下：クリックで展開するプレビュー ↓↓↓
-                    # with st.expander("✅ 現在の反映対象（プレビュー）を表示", expanded=False):
-                    #     rows = []
-                    #     for idx in valid_auto_idx:
-                    #         rows.append({"種別": "自動（有効）", "ピクセル": int(pixel_index[idx]), "強度(a.u.)": float(spectrum_data[idx])})
-                    #     for idx in manual_idx:
-                    #         rows.append({"種別": "手動追加", "ピクセル": int(pixel_index[idx]), "強度(a.u.)": float(spectrum_data[idx])})
-                    #     if rows:
-                    #         st.dataframe(pd.DataFrame(rows).sort_values("ピクセル"), use_container_width=True)
-                    #     else:
-                    #         st.info("反映対象がまだありません。手動追加するか、除外を解除してください。")
-
                 # ---- 右：コンパクトなコントロール ----
                 with col_ctrl:
+                    # 既定ピーク順チェック（手動調整の上）＋プレビュー
+                    st.checkbox(
+                        "増加順",
+                        value=False,
+                        key="chk_increasing",
+                        help="オンの場合、既定のエタノール既知ピーク（default_ethanol_peaks）を逆順に適用します。"
+                    )
+                    _preview = processor.default_ethanol_peaks[:]
+                    if st.session_state.get("chk_increasing", False):
+                        _preview = list(reversed(_preview))
+                    st.caption("既定ピーク（適用順）: " + ", ".join(f"{v:.1f}" for v in _preview))
+
                     st.markdown("**🔧 手動調整**")
 
                     tabs = st.tabs(["追加", "除外/復活"])
@@ -439,66 +420,79 @@ if uploaded_file is not None:
                                     st.success("除外しました。")
                                     st.rerun()
 
-                # ---- 適用ボタン ----
-                # st.write("")
-                # reset_wn_on_apply = st.checkbox("適用時に既定ピークリストで波数を再初期化する", value=False, key="reset_wn_on_apply")
+                # ---- 更新（適用）ボタン ----
                 reset_wn_on_apply = False
                 if st.button("更新", use_container_width=True):
-                    valid_auto_idx = np.array([i for i in sel_idx if i not in excluded], dtype=int)
-                    manual_idx = np.array(st.session_state.get("manual_peaks_idx", []), dtype=int)
-                    combined_idx = np.unique(np.concatenate([valid_auto_idx, manual_idx])).astype(int)
-                    combined_idx.sort()
-                    if combined_idx.size == 0:
-                        st.warning("反映対象が空です。")
+                    # ===== 重要な修正点 =====
+                    # 既に適用済みなら、手動編集を含む matched_pixels をそのまま尊重する
+                    # （以前のように自動候補＋手動候補から毎回再構成しない）
+                    if st.session_state.get("peaks_applied", False) and "matched_pixels" in st.session_state:
+                        new_pixels = list(st.session_state.matched_pixels)  # 手動変更を保持
                     else:
+                        # 初回適用のみ：自動候補＋手動候補から構成
+                        valid_auto_idx = np.array([i for i in sel_idx if i not in excluded], dtype=int)
+                        manual_idx = np.array(st.session_state.get("manual_peaks_idx", []), dtype=int)
+                        combined_idx = np.unique(np.concatenate([valid_auto_idx, manual_idx])).astype(int)
+                        combined_idx.sort()
+                        if combined_idx.size == 0:
+                            st.warning("反映対象が空です。")
+                            st.stop()
                         new_pixels = pixel_index[combined_idx].astype(int).tolist()
 
-                        # ▼ ロックを考慮
-                        if "matched_pixels" in st.session_state and st.session_state.get("peaks_applied", False):
-                            old_pixels = st.session_state.get("matched_pixels", [])
-                            if len(old_pixels) == len(new_pixels):
-                                locked = st.session_state.get("locked_pixels", set())
-                                for i_lock in locked:
-                                    if 0 <= i_lock < len(new_pixels):
-                                        new_pixels[i_lock] = int(old_pixels[i_lock])
-                            else:
-                                st.session_state["locked_pixels"] = set()
+                    # ▼ ロックを考慮（長さが同じときのみロック位置を上書き）
+                    if "matched_pixels" in st.session_state and st.session_state.get("peaks_applied", False):
+                        old_pixels = st.session_state.get("matched_pixels", [])
+                        if len(old_pixels) == len(new_pixels):
+                            locked = st.session_state.get("locked_pixels", set())
+                            for i_lock in locked:
+                                if 0 <= i_lock < len(new_pixels):
+                                    new_pixels[i_lock] = int(old_pixels[i_lock])
+                        else:
+                            st.session_state["locked_pixels"] = set()
 
-                        st.session_state.matched_pixels = new_pixels
+                    st.session_state.matched_pixels = new_pixels
 
-                        n = len(st.session_state.matched_pixels)
-                        need_reset_wn = (
-                            reset_wn_on_apply or
-                            ("matched_wavenumbers" not in st.session_state) or
-                            (len(st.session_state.matched_wavenumbers) != n)
-                        )
-                        if need_reset_wn:
-                            default_peaks = processor.default_ethanol_peaks[:]
-                            if n <= len(default_peaks):
-                                new_wn = [float(v) for v in default_peaks[:n]]
-                            else:
-                                pad = [float(default_peaks[-1])] * (n - len(default_peaks))
-                                new_wn = [float(v) for v in default_peaks] + pad
+                    # 波数配列の長さ整合（ロック考慮）
+                    n = len(st.session_state.matched_pixels)
+                    need_reset_wn = (
+                        reset_wn_on_apply or
+                        ("matched_wavenumbers" not in st.session_state) or
+                        (len(st.session_state.matched_wavenumbers) != n)
+                    )
+                    if need_reset_wn:
+                        default_peaks = processor.default_ethanol_peaks[:]
+                        if st.session_state.get("chk_increasing", False):
+                            default_peaks = list(reversed(default_peaks))
 
-                            if "matched_wavenumbers" in st.session_state and not reset_wn_on_apply:
-                                old_wn = st.session_state.get("matched_wavenumbers", [])
-                                locked_w = st.session_state.get("locked_wavenumbers", set())
-                                for i_lock in locked_w:
-                                    if 0 <= i_lock < n and i_lock < len(old_wn):
-                                        new_wn[i_lock] = float(old_wn[i_lock])
-                            st.session_state.matched_wavenumbers = new_wn
+                        if n <= len(default_peaks):
+                            new_wn = [float(v) for v in default_peaks[:n]]
+                        else:
+                            pad = [float(default_peaks[-1])] * (n - len(default_peaks))
+                            new_wn = [float(v) for v in default_peaks] + pad
 
+                        if "matched_wavenumbers" in st.session_state and not reset_wn_on_apply:
+                            old_wn = st.session_state.get("matched_wavenumbers", [])
+                            locked_w = st.session_state.get("locked_wavenumbers", set())
+                            for i_lock in locked_w:
+                                if 0 <= i_lock < n and i_lock < len(old_wn):
+                                    new_wn[i_lock] = float(old_wn[i_lock])
+                        st.session_state.matched_wavenumbers = new_wn
+
+                    # ROI は既存を尊重しつつ不足分のみ作成
+                    if "peak_rois" not in st.session_state:
                         st.session_state.peak_rois = {}
-                        roi_size = 100
-                        for i, px in enumerate(st.session_state.matched_pixels):
+                    roi_size = 100
+                    for i, px in enumerate(st.session_state.matched_pixels):
+                        if i not in st.session_state.peak_rois:
                             st.session_state.peak_rois[i] = {
                                 "min": max(int(px - roi_size), int(min(pixel_index))),
                                 "max": min(int(px + roi_size), int(max(pixel_index))),
                             }
 
-                        st.session_state.peaks_applied = True
-                        st.success(f"{len(st.session_state.matched_pixels)} 個のピークを反映しました。")
-                        st.rerun()
+                    st.session_state.peaks_applied = True
+                    st.success(f"{len(st.session_state.matched_pixels)} 個のピークを反映しました。")
+                    st.rerun()
+
         # --------------------------------------------------
         # ここから下は「適用」後にのみ表示
         # --------------------------------------------------
@@ -529,10 +523,69 @@ if uploaded_file is not None:
                                    xaxis_title="ピクセル位置", yaxis_title="強度", height=500, showlegend=True)
             st.plotly_chart(fig_main, use_container_width=True)
 
-            # 各ピークのROI付き調整（ピクセル位置は適用結果で初期化済み）
+            # 各ピークのROI付き調整（＋ボタン付き）
             st.subheader("🔍 各ピークのROI付き調整")
-            tab_labels = [f"ピーク {i+1}" for i in range(len(st.session_state.matched_pixels))]
-            tabs = st.tabs(tab_labels)
+            # 行：左にタブ、右に＋ボタン
+            col_tabs, col_addbtn = st.columns([6, 1])
+            with col_tabs:
+                tab_labels = [f"ピーク {i+1}" for i in range(len(st.session_state.matched_pixels))]
+                tabs = st.tabs(tab_labels)
+            with col_addbtn:
+                # 追加ボタン：タブ列の右側
+                if st.button("＋", key="btn_add_peak_roi", help="新しいピークを追加します"):
+                    # 既存ピークから十分離れた候補のうち、強度最大のピクセルを採用
+                    used_idx = np.array([int(np.argmin(np.abs(pixel_index - px))) for px in st.session_state.matched_pixels], dtype=int)
+                    min_dist = int(st.session_state.get("auto_min_distance", 20))
+                    candidates = np.ones_like(pixel_index, dtype=bool)
+
+                    # 端の安全域（ROI=100のため）
+                    edge_pad = 100
+                    candidates[:edge_pad] = False
+                    candidates[-edge_pad:] = False
+
+                    for ui in used_idx:
+                        lo = max(0, ui - min_dist)
+                        hi = min(len(pixel_index), ui + min_dist + 1)
+                        candidates[lo:hi] = False
+
+                    if np.any(candidates):
+                        cand_idx = np.argmax(np.where(candidates, spectrum_data, -np.inf))
+                        new_px_val = int(pixel_index[cand_idx])
+                    else:
+                        # 候補が無い場合は中央近傍
+                        center_idx = int(len(pixel_index) // 2)
+                        new_px_val = int(pixel_index[center_idx])
+
+                    # 波数は default_ethanol_peaks（増加順チェックに追従）から割当
+                    default_peaks = processor.default_ethanol_peaks[:]
+                    if st.session_state.get("chk_increasing", False):
+                        default_peaks = list(reversed(default_peaks))
+                    next_i = len(st.session_state.matched_wavenumbers) if "matched_wavenumbers" in st.session_state else 0
+                    if next_i < len(default_peaks):
+                        new_wn_val = float(default_peaks[next_i])
+                    else:
+                        new_wn_val = float(default_peaks[-1])
+
+                    # 追加反映（ソースオブトゥルースへ追記）
+                    st.session_state.matched_pixels.append(int(new_px_val))
+                    if "matched_wavenumbers" not in st.session_state:
+                        st.session_state.matched_wavenumbers = []
+                    st.session_state.matched_wavenumbers.append(float(new_wn_val))
+
+                    # ROI 付与
+                    roi_size = 100
+                    i_new = len(st.session_state.matched_pixels) - 1
+                    if "peak_rois" not in st.session_state:
+                        st.session_state.peak_rois = {}
+                    st.session_state.peak_rois[i_new] = {
+                        'min': max(int(new_px_val - roi_size), int(min(pixel_index))),
+                        'max': min(int(new_px_val + roi_size), int(max(pixel_index)))
+                    }
+
+                    st.success(f"新規ピークを追加: pixel={new_px_val}, wavenumber={new_wn_val:.1f} cm⁻¹")
+                    st.rerun()
+
+            # 既存タブ内容
             for i, tab in enumerate(tabs):
                 with tab:
                     # ROI 初期化（無ければ適用済みピクセルを基準に自動設定）
@@ -561,12 +614,13 @@ if uploaded_file is not None:
                             help="ピクセル位置を入力してください（ROIは±100ピクセルで自動調整）"
                         )
                         if new_pixel != current_pixel:
-                            st.session_state.matched_pixels[i] = new_pixel
+                            st.session_state.matched_pixels[i] = int(new_pixel)  # ← 手動編集を即時反映（ソースオブトゥルース）
                             roi_size = 100
                             new_roi_min = max(int(new_pixel - roi_size), int(min(pixel_index)))
                             new_roi_max = min(int(new_pixel + roi_size), int(max(pixel_index)))
                             st.session_state.peak_rois[i]['min'] = new_roi_min
                             st.session_state.peak_rois[i]['max'] = new_roi_max
+                            st.rerun()
 
                     # ---- 波数（cm⁻¹） ----
                     with col_wavenumber:
@@ -578,7 +632,7 @@ if uploaded_file is not None:
                             format="%.1f",
                             key=f"wavenumber_input_{i}"
                         )
-                        st.session_state.matched_wavenumbers[i] = new_wavenumber
+                        st.session_state.matched_wavenumbers[i] = float(new_wavenumber)
                         current_wavelength = processor.wavenumber_to_wavelength(new_wavenumber)
                         st.caption(f"波長: {current_wavelength:.2f} nm")
                         spectrum_intensity = np.interp(st.session_state.matched_pixels[i], pixel_index, spectrum_data)
@@ -596,8 +650,8 @@ if uploaded_file is not None:
                         if roi_min >= roi_max:
                             st.error("⚠️ ROI最小はROI最大より小さくする必要があります")
                         else:
-                            st.session_state.peak_rois[i]['min'] = roi_min
-                            st.session_state.peak_rois[i]['max'] = roi_max
+                            st.session_state.peak_rois[i]['min'] = int(roi_min)
+                            st.session_state.peak_rois[i]['max'] = int(roi_max)
                         st.caption(f"ROI範囲: {roi_max - roi_min} ピクセル")
 
                     with col_roi_plot:
@@ -627,7 +681,6 @@ if uploaded_file is not None:
             peak_df = pd.DataFrame({
                 'ピーク': [f"ピーク {i+1}" for i in range(len(st.session_state.matched_pixels))],
                 'ピクセル位置': [f"{p:.1f}" for p in st.session_state.matched_pixels],
-                # '波長 (nm)': [f"{processor.wavenumber_to_wavelength(wn):.2f}" for wn in st.session_state.matched_wavenumbers],
                 '波数 (cm⁻¹)': st.session_state.matched_wavenumbers,
             })
             st.dataframe(peak_df, use_container_width=True)
@@ -673,45 +726,11 @@ if uploaded_file is not None:
             with m4: st.metric("最大|誤差| (cm⁻¹)", f"{metrics['max_abs']:.3f}")
             with m5: st.metric("SSE (二乗和)", f"{metrics['sse']:.3f}")
 
-            # 係数表示
-            
             # 指定 vs 計算（cm^-1）
-            # st.subheader("指定波数 vs 計算波数（誤差一覧）")
             target_cm1 = np.array(st.session_state.matched_wavenumbers, dtype=float)
             err = calc_cm1 - target_cm1
             abs_err = np.abs(err)
             sq_err = err**2
-
-            # peak_table = pd.DataFrame({
-            #     "ピーク": [f"ピーク {i+1}" for i in range(len(target_cm1))],
-            #     "ピクセル": [int(p) for p in metrics["pixels"]],
-            #     "指定 波数(cm⁻¹)": target_cm1,
-            #     "計算 波数(cm⁻¹)": calc_cm1,
-            #     "差(計算-指定)": err,
-            #     "絶対誤差 |cm⁻¹|": abs_err,
-            #     "二乗誤差 (cm⁻²)": sq_err
-            # })
-            # st.dataframe(
-            #     peak_table.style.format({
-            #         "指定 波数(cm⁻¹)": "{:.3f}",
-            #         "計算 波数(cm⁻¹)": "{:.3f}",
-            #         "差(計算-指定)": "{:.3f}",
-            #         "絶対誤差 |cm⁻¹|": "{:.3f}",
-            #         "二乗誤差 (cm⁻²)": "{:.3f}",
-            #     }),
-            #     use_container_width=True
-            # )
-
-            # 要約表（絶対値合計・二乗和・MAE・RMSE など）
-            # st.subheader("誤差サマリー（表）")
-            # mae = float(np.mean(abs_err))
-            # sse = float(np.sum(sq_err))  # == metrics["sse"]
-            # l1_sum = float(np.sum(abs_err))
-            # summary_df = pd.DataFrame({
-            #     "指標": ["合計絶対誤差 (L1)", "二乗和 (SSE)", "MAE (平均絶対誤差)", "RMSE", "最大|誤差|"],
-            #     "値": [l1_sum, sse, mae, float(metrics["rmse"]), float(metrics["max_abs"])]
-            # })
-            # st.table(summary_df.style.format({"値": "{:.6f}"}))
 
             # 誤差プロット（折れ線）
             st.subheader("誤差プロット（cm⁻¹）")
@@ -732,39 +751,6 @@ if uploaded_file is not None:
             )
             st.plotly_chart(fig_err, use_container_width=True)
 
-            # 追加：絶対値と二乗和 を表すグラフ（バー）
-            # st.subheader("絶対誤差・二乗誤差（バーグラフ）")
-            # c1, c2 = st.columns(2)
-            # with c1:
-            #     fig_abs = go.Figure()
-            #     fig_abs.add_trace(go.Bar(
-            #         x=[f"#{i+1}" for i in range(len(abs_err))],
-            #         y=abs_err,
-            #         name="絶対誤差 |cm⁻¹|"
-            #     ))
-            #     fig_abs.add_hline(y=float(tol_cm1), line_dash="dash", line_color="red", opacity=0.6)
-            #     fig_abs.update_layout(
-            #         xaxis_title="ピーク番号",
-            #         yaxis_title="|誤差| (cm⁻¹)",
-            #         height=350,
-            #         showlegend=False
-            #     )
-            #     st.plotly_chart(fig_abs, use_container_width=True)
-            # with c2:
-            #     fig_sq = go.Figure()
-            #     fig_sq.add_trace(go.Bar(
-            #         x=[f"#{i+1}" for i in range(len(sq_err))],
-            #         y=sq_err,
-            #         name="二乗誤差 (cm⁻²)"
-            #     ))
-            #     fig_sq.update_layout(
-            #         xaxis_title="ピーク番号",
-            #         yaxis_title="誤差² (cm⁻²)",
-            #         height=350,
-            #         showlegend=False
-            #     )
-            #     st.plotly_chart(fig_sq, use_container_width=True)
-
             st.subheader("多項式近似（pixel→wavenumber）カーブ")
             poly = coeffs_poly_padded if 'coeffs_poly_padded' in locals() else coeffs_poly
             x_fit = np.linspace(min(metrics["pixels"]), max(metrics["pixels"]), 1000)
@@ -781,20 +767,18 @@ if uploaded_file is not None:
 
             # 参考：pixel→wavelength カーブ
             with st.expander("多項式近似（pixel→wavelength）カーブを表示", expanded=False):
-                # st.subheader("多項式近似（pixel→wavelength）カーブ")
                 x_fit = np.linspace(min(metrics["pixels"]), max(metrics["pixels"]), 1000)
-                y_fit = np.polyval(coeffs_poly_padded, x_fit)  # ← 差し替え
+                y_fit = np.polyval(coeffs_poly_padded, x_fit)
                 fig_fit = go.Figure()
-                fig_fit.add_trace(go.Scatter(x=metrics["pixels"], y=np.polyval(coeffs_poly_padded, metrics["pixels"]),  # ← 差し替え
+                fig_fit.add_trace(go.Scatter(x=metrics["pixels"], y=np.polyval(coeffs_poly_padded, metrics["pixels"]),
                                             mode="markers", name="採用ピーク(波長)"))
                 fig_fit.add_trace(go.Scatter(x=x_fit, y=y_fit, mode="lines", name=f"{degree}次近似"))
-
                 fig_fit.update_layout(xaxis_title="pixel", yaxis_title="wavelength (nm)", height=380)
                 st.plotly_chart(fig_fit, use_container_width=True)
 
             # エクスポート
             st.subheader("結果のエクスポート")
-            formatted_coeffs = [f'"{coeff:.7E}"' for coeff in coeffs_poly_padded[::-1]]  # ← 差し替え（B_0..B_5想定）
+            formatted_coeffs = [f'"{coeff:.7E}"' for coeff in coeffs_poly_padded[::-1]]
             server_format = f"'b_coeff': [{', '.join(formatted_coeffs)}],\n'laser_wavelength': {processor.laser_wavelength},\n'degree': {int(degree)}"
             st.code(server_format, language='python')
 
@@ -806,13 +790,11 @@ if uploaded_file is not None:
             lines.append(f"RMSE(cm^-1): {metrics['rmse']:.6f}")
             lines.append(f"MaxAbs(cm^-1): {metrics['max_abs']:.6f}")
             lines.append(f"SSE(cm^-1^2): {metrics['sse']:.6f}")
-            # lines.append(f"L1 Sum(cm^-1): {l1_sum:.6f}")
-            # lines.append(f"MAE(cm^-1): {mae:.6f}\n")
             lines.append("Peaks:")
             for i, (px, tgt, est, e, ae, se) in enumerate(zip(metrics["pixels"], target_cm1, calc_cm1, err, abs_err, sq_err), 1):
                 lines.append(f"  Peak {i}: pixel={px:.2f}, target={tgt:.3f}, calc={est:.3f}, diff={e:.3f}, |diff|={ae:.3f}, diff^2={se:.3f}")
             lines.append("\nCoeffs (B_0..B_n on wavelength):")
-            for i, c in enumerate(coeffs_poly_padded[::-1]):  # ← 差し替え
+            for i, c in enumerate(coeffs_poly_padded[::-1]):
                 lines.append(f"B_{i} = {c:.10e}")
             st.download_button(
                 "📥 フィット結果をダウンロード",
