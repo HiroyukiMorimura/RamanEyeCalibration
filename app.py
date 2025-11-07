@@ -759,11 +759,13 @@ if uploaded_file is not None:
             y_pts_wl = np.polyval(poly, metrics["pixels"])
             y_pts_cm1 = _wl_to_cm1_float(processor.laser_wavelength, y_pts_wl)
             fig_fit = go.Figure()
-            fig_fit.add_trace(go.Scatter(x=metrics["pixels"], y=y_pts_cm1,
-                                        mode="markers", name="採用ピーク(波数)"))
-            fig_fit.add_trace(go.Scatter(x=x_fit, y=y_fit_cm1, mode="lines", name=f"{degree}次近似"))
-            fig_fit.update_layout(xaxis_title="pixel", yaxis_title="wavenumber (cm⁻¹)", height=380)
-            st.plotly_chart(fig_fit, use_container_width=True)
+            fig_fit.add_trace(go.Scatter(
+                x=st.session_state.matched_pixels,
+                y=st.session_state.matched_wavenumbers,
+                mode="markers",
+                name="採用ピーク（手動含む実測）",
+                marker=dict(size=10, color="orange", symbol="circle")
+            ))
 
             # 参考：pixel→wavelength カーブ
             with st.expander("多項式近似（pixel→wavelength）カーブを表示", expanded=False):
