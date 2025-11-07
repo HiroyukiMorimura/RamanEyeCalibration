@@ -7,14 +7,16 @@ from scipy.signal import savgol_filter, find_peaks, peak_prominences
 from csv_processor import StreamlitRamanSpectrumProcessor
 
 st.set_page_config(
-    page_title="インタラクティブ・ラマン分光キャリブレーション",
-    page_icon="📊",
+    page_title="ラマンピークキャリブレーション",
+    page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.title("🔬 インタラクティブなラマンピーク調整")
-st.markdown("ピーク位置と波数を調整して分光器をキャリブレーションします")
+st.title("ラマンピークキャリブレーション")
+st.markdown("エタノールを用いてピーク位置と波数をキャリブレーションします")
+st.header("📁 データ入力")
+uploaded_file = st.file_uploader("CSVファイルをアップロード", type=['csv'], help="ラマンスペクトルのCSVをアップロードしてください")
 
 # ------------------------------------------------------------
 # 自動ピーク検出ヘルパー（2次微分＋卓立度）
@@ -61,19 +63,137 @@ def detect_peaks_sd_prom(pixel_index, spectrum, smooth_win=11,
 
     return peaks.astype(int), d2, prom
 
+# ------------------------------------------------------------
+# 5次フィット + 摂動（SSE最小化, cm^-1評価）
+# ------------------------------------------------------------
+def _wl_to_cm1_float(laser_nm, wavelength_nm):
+    """float精度で波長→ラマンシフト(cm^-1)へ（csv_processor の int化を回避）"""
+    wl = np.asarray(wavelength_nm, dtype=float)
+    wl = np.clip(wl, 1e-6, None)  # 0割防止
+    return 1e7/laser_nm - 1e7/wl
+
+def fit_poly_with_jitter_cm1(processor, pixels, target_cm1,
+                             degree=5, tol_cm1=2.0, max_jitter_px=2,
+                             max_iter=25, subpixel=False):
+    """
+    目的:
+        pixel→wavelength を degree 次多項式でフィット。
+        その上で各ピークの pixel に ±max_jitter_px（必要ならサブピクセル）の
+        微小摂動を許容し、cm^-1 誤差の二乗和(SSE)を最小に。
+
+    評価:
+        SSE(cm^-1) = sum((calc_cm1 - target_cm1)^2)
+        収束: max|誤差| <= tol_cm1  または 最大反復到達
+
+    戻り:
+        coeffs: np.polyfit の係数（wavelength = P(pixel)）
+        metrics: dict（SSE, RMSE, MaxAbs, iterations, converged, 最終pixels, residuals(cm^-1), history）
+        calc_cm1_final: 各ピークの最終推定cm^-1
+    """
+    px = np.asarray(pixels, dtype=float)
+    wn = np.asarray(target_cm1, dtype=float)
+
+    # 安全化
+    if len(px) < 2:
+        raise ValueError("ピーク数が不足しています。最低2点が必要です。")
+    deg = min(int(degree), len(px) - 1)
+
+    # x昇順
+    order = np.argsort(px)
+    px = px[order]
+    wn = wn[order]
+
+    # 初期フィット（波長領域）
+    y_w = processor.wavenumber_to_wavelength(wn)  # ここは元のロジック踏襲
+    coeffs = np.polyfit(px, y_w, deg)
+
+    def eval_metrics(px_, coeffs_):
+        wave_hat = np.polyval(coeffs_, px_)
+        cm1_hat = _wl_to_cm1_float(processor.laser_wavelength, wave_hat)
+        resid = cm1_hat - wn
+        sse = float(np.sum(resid**2))
+        rmse = float(np.sqrt(np.mean(resid**2)))
+        max_abs = float(np.max(np.abs(resid)))
+        return cm1_hat, resid, sse, rmse, max_abs
+
+    history = []
+    for it in range(max_iter):
+        cm1_hat, resid, sse, rmse, max_abs = eval_metrics(px, coeffs)
+        history.append((sse, rmse, max_abs))
+        if max_abs <= tol_cm1:
+            return coeffs, {
+                "iterations": it,
+                "sse": sse, "rmse": rmse, "max_abs": max_abs,
+                "pixels": px.copy(), "residuals": resid.copy(),
+                "converged": True, "history": history
+            }, cm1_hat
+
+        improved_any = False
+        for i in range(len(px)):
+            base_px = px[i]
+            best_dx = 0.0
+            best_tuple = (sse, rmse, max_abs, coeffs)
+
+            # 候補：整数 ±max_jitter_px
+            candidates = list(range(-max_jitter_px, max_jitter_px + 1))
+            # サブピクセル（任意）
+            if subpixel:
+                candidates += [d/4.0 for d in range(-2, 3)]  # ±0.5 を0.25刻み
+
+            tried = set()
+            for dx in candidates:
+                if dx in tried:
+                    continue
+                tried.add(dx)
+                new_px = base_px + dx
+
+                # 単調性（隣接と交差しない）維持
+                if i > 0 and new_px <= px[i-1]:
+                    continue
+                if i < len(px)-1 and new_px >= px[i+1]:
+                    continue
+
+                px_try = px.copy()
+                px_try[i] = new_px
+
+                # 再フィット
+                coeffs_try = np.polyfit(px_try, y_w, deg)
+                _, _, sse_try, rmse_try, max_abs_try = eval_metrics(px_try, coeffs_try)
+
+                if sse_try + 1e-9 < best_tuple[0]:
+                    best_dx = dx
+                    best_tuple = (sse_try, rmse_try, max_abs_try, coeffs_try)
+
+            if best_dx != 0.0:
+                px[i] = px[i] + best_dx
+                coeffs = best_tuple[3]
+                improved_any = True
+
+        if not improved_any:
+            break
+
+    # 終了（未達ならベストを返す）
+    cm1_hat, resid, sse, rmse, max_abs = eval_metrics(px, coeffs)
+    return coeffs, {
+        "iterations": it+1,
+        "sse": sse, "rmse": rmse, "max_abs": max_abs,
+        "pixels": px.copy(), "residuals": resid.copy(),
+        "converged": (max_abs <= tol_cm1),
+        "history": history
+    }, cm1_hat
+
 
 # Initialize processor
 processor = StreamlitRamanSpectrumProcessor()
 
 # Sidebar for configuration
 with st.sidebar:
-    st.header("⚙️ 設定")
-    laser_wavelength = st.number_input("レーザー波長 (nm)", value=532, min_value=200, max_value=2000, step=1)
+    st.header("設定")
+    laser_wavelength = st.selectbox("レーザー波長 (nm)", options=[532, 785, 830], index=0)
     processor.laser_wavelength = laser_wavelength
     
-    st.divider()
-    st.header("📁 データ入力")
-    uploaded_file = st.file_uploader("CSVファイルをアップロード", type=['csv'], help="ラマンスペクトルのCSVをアップロードしてください")
+    # st.header("📁 データ入力")
+    # uploaded_file = st.file_uploader("CSVファイルをアップロード", type=['csv'], help="ラマンスペクトルのCSVをアップロードしてください")
 
     # -------------------------------
     # 自動ピーク検出（サイドバー）
@@ -83,13 +203,13 @@ with st.sidebar:
         smooth_win = st.number_input("平滑化ウィンドウ(奇数)", min_value=1, max_value=501, value=25, step=2, key="auto_smooth_win")
         deriv_thresh = st.number_input("2次微分閾値(高さ)", min_value=0, max_value=1000, value=5, step=1, key="auto_deriv_thresh")
         prom_thresh  = st.number_input("卓立度閾値", min_value=0, max_value=1000, value=5, step=1, key="auto_prom_thresh")
-        min_distance = st.number_input("最小ピーク間隔(ピクセル)", min_value=1, max_value=1000, value=10, step=1, key="auto_min_distance")
+        min_distance = st.number_input("最小ピーク間隔(ピクセル)", min_value=1, max_value=10, value=1, step=1, key="auto_min_distance")
 
         # 反映する個数（prominence降順の上位）
         default_k = 10  # 既定ピークリストの長さに合わせて10を推奨
         top_k = st.number_input("反映するピーク数(上位prominence順)", min_value=1, max_value=200, value=int(default_k), step=1, key="auto_top_k")
 
-        st.button("🔍 検出を実行", key="btn_run_detect_sidebar")
+        # st.button("🔍 検出を実行", key="btn_run_detect_sidebar")
 
 
 # Main content area
@@ -99,6 +219,12 @@ if uploaded_file is not None:
     if pixel_index is not None and spectrum_data is not None:
         st.success(f"✅ データを読み込みました！ {len(pixel_index)} 点")
 
+        # ▼ 追加：ロック集合の初期化
+        if "locked_pixels" not in st.session_state:
+            st.session_state["locked_pixels"] = set()
+        if "locked_wavenumbers" not in st.session_state:
+            st.session_state["locked_wavenumbers"] = set()
+
         # ファイルが切り替わったら検出/手動/除外/適用状態を初期化
         if st.session_state.get("last_uploaded_name") != uploaded_file.name:
             st.session_state["manual_peaks_idx"] = []        # 手動追加（インデックス）
@@ -106,22 +232,35 @@ if uploaded_file is not None:
             for k in ["auto_peaks_idx", "auto_peaks_prom", "auto_d2",
                       "peaks_applied", "matched_pixels", "matched_wavenumbers", "peak_rois"]:
                 st.session_state.pop(k, None)
+            # ▼ ロックもリセット
+            st.session_state["locked_pixels"] = set()
+            st.session_state["locked_wavenumbers"] = set()
             st.session_state["last_uploaded_name"] = uploaded_file.name
-
         # サイドバーのボタンで検出
-        if st.session_state.get("btn_run_detect_sidebar"):
-            det_idx, d2, det_prom = detect_peaks_sd_prom(
-                pixel_index=pixel_index,
-                spectrum=spectrum_data,
-                smooth_win=st.session_state.get("auto_smooth_win", 11),
-                deriv_thresh=st.session_state.get("auto_deriv_thresh", 20.0),
-                prom_thresh=st.session_state.get("auto_prom_thresh", 10.0),
-                min_distance=st.session_state.get("auto_min_distance", 20),
-            )
-            st.session_state["auto_peaks_idx"] = det_idx
-            st.session_state["auto_peaks_prom"] = det_prom
-            st.session_state["auto_d2"] = d2
-
+        # if st.session_state.get("btn_run_detect_sidebar"):
+        #     det_idx, d2, det_prom = detect_peaks_sd_prom(
+        #         pixel_index=pixel_index,
+        #         spectrum=spectrum_data,
+        #         smooth_win=st.session_state.get("auto_smooth_win", 11),
+        #         deriv_thresh=st.session_state.get("auto_deriv_thresh", 20.0),
+        #         prom_thresh=st.session_state.get("auto_prom_thresh", 10.0),
+        #         min_distance=st.session_state.get("auto_min_distance", 20),
+        #     )
+        #     st.session_state["auto_peaks_idx"] = det_idx
+        #     st.session_state["auto_peaks_prom"] = det_prom
+        #     st.session_state["auto_d2"] = d2
+        # 新（アップロード直後やパラメータ変更で毎回自動実行されます）:
+        det_idx, d2, det_prom = detect_peaks_sd_prom(
+            pixel_index=pixel_index,
+            spectrum=spectrum_data,
+            smooth_win=st.session_state.get("auto_smooth_win", 11),
+            deriv_thresh=st.session_state.get("auto_deriv_thresh", 20.0),
+            prom_thresh=st.session_state.get("auto_prom_thresh", 10.0),
+            min_distance=st.session_state.get("auto_min_distance", 20),
+        )
+        st.session_state["auto_peaks_idx"] = det_idx
+        st.session_state["auto_peaks_prom"] = det_prom
+        st.session_state["auto_d2"] = d2
         # --------------------------------------------------
         # 検出結果の表示＋手動制御（「適用」まではここだけ表示）
         # --------------------------------------------------
@@ -218,16 +357,16 @@ if uploaded_file is not None:
                     st.plotly_chart(fig_auto, use_container_width=True)
 
                     # ↓↓↓ グラフ直下：クリックで展開するプレビュー ↓↓↓
-                    with st.expander("✅ 現在の反映対象（プレビュー）を表示", expanded=False):
-                        rows = []
-                        for idx in valid_auto_idx:
-                            rows.append({"種別": "自動（有効）", "ピクセル": int(pixel_index[idx]), "強度(a.u.)": float(spectrum_data[idx])})
-                        for idx in manual_idx:
-                            rows.append({"種別": "手動追加", "ピクセル": int(pixel_index[idx]), "強度(a.u.)": float(spectrum_data[idx])})
-                        if rows:
-                            st.dataframe(pd.DataFrame(rows).sort_values("ピクセル"), use_container_width=True)
-                        else:
-                            st.info("反映対象がまだありません。手動追加するか、除外を解除してください。")
+                    # with st.expander("✅ 現在の反映対象（プレビュー）を表示", expanded=False):
+                    #     rows = []
+                    #     for idx in valid_auto_idx:
+                    #         rows.append({"種別": "自動（有効）", "ピクセル": int(pixel_index[idx]), "強度(a.u.)": float(spectrum_data[idx])})
+                    #     for idx in manual_idx:
+                    #         rows.append({"種別": "手動追加", "ピクセル": int(pixel_index[idx]), "強度(a.u.)": float(spectrum_data[idx])})
+                    #     if rows:
+                    #         st.dataframe(pd.DataFrame(rows).sort_values("ピクセル"), use_container_width=True)
+                    #     else:
+                    #         st.info("反映対象がまだありません。手動追加するか、除外を解除してください。")
 
                 # ---- 右：コンパクトなコントロール ----
                 with col_ctrl:
@@ -300,9 +439,11 @@ if uploaded_file is not None:
                                     st.success("除外しました。")
                                     st.rerun()
 
-                # ---- 適用ボタン（押すまで以降のセクションは表示しない） ----
-                st.write("")
-                if st.button("✅ 上記の反映対象で matched_pixels を更新", use_container_width=True):
+                # ---- 適用ボタン ----
+                # st.write("")
+                # reset_wn_on_apply = st.checkbox("適用時に既定ピークリストで波数を再初期化する", value=False, key="reset_wn_on_apply")
+                reset_wn_on_apply = False
+                if st.button("更新", use_container_width=True):
                     valid_auto_idx = np.array([i for i in sel_idx if i not in excluded], dtype=int)
                     manual_idx = np.array(st.session_state.get("manual_peaks_idx", []), dtype=int)
                     combined_idx = np.unique(np.concatenate([valid_auto_idx, manual_idx])).astype(int)
@@ -310,20 +451,43 @@ if uploaded_file is not None:
                     if combined_idx.size == 0:
                         st.warning("反映対象が空です。")
                     else:
-                        # ピクセル位置を確定
-                        st.session_state.matched_pixels = pixel_index[combined_idx].astype(int).tolist()
+                        new_pixels = pixel_index[combined_idx].astype(int).tolist()
 
-                        # ★ 波数（cm⁻¹）は既定エタノールピークを「ピーク1から順」にセット
-                        default_peaks = processor.default_ethanol_peaks[:]  # 長さ10: [2973,2927,2876,1455,1277,1097,1063,880,434,0]
+                        # ▼ ロックを考慮
+                        if "matched_pixels" in st.session_state and st.session_state.get("peaks_applied", False):
+                            old_pixels = st.session_state.get("matched_pixels", [])
+                            if len(old_pixels) == len(new_pixels):
+                                locked = st.session_state.get("locked_pixels", set())
+                                for i_lock in locked:
+                                    if 0 <= i_lock < len(new_pixels):
+                                        new_pixels[i_lock] = int(old_pixels[i_lock])
+                            else:
+                                st.session_state["locked_pixels"] = set()
+
+                        st.session_state.matched_pixels = new_pixels
+
                         n = len(st.session_state.matched_pixels)
-                        if n <= len(default_peaks):
-                            st.session_state.matched_wavenumbers = [float(v) for v in default_peaks[:n]]
-                        else:
-                            # 既定を超える場合は末尾の値(0)でパディング
-                            pad = [float(default_peaks[-1])] * (n - len(default_peaks))
-                            st.session_state.matched_wavenumbers = [float(v) for v in default_peaks] + pad
+                        need_reset_wn = (
+                            reset_wn_on_apply or
+                            ("matched_wavenumbers" not in st.session_state) or
+                            (len(st.session_state.matched_wavenumbers) != n)
+                        )
+                        if need_reset_wn:
+                            default_peaks = processor.default_ethanol_peaks[:]
+                            if n <= len(default_peaks):
+                                new_wn = [float(v) for v in default_peaks[:n]]
+                            else:
+                                pad = [float(default_peaks[-1])] * (n - len(default_peaks))
+                                new_wn = [float(v) for v in default_peaks] + pad
 
-                        # ROI を現在の matched_pixels に基づき再構築（±100px）
+                            if "matched_wavenumbers" in st.session_state and not reset_wn_on_apply:
+                                old_wn = st.session_state.get("matched_wavenumbers", [])
+                                locked_w = st.session_state.get("locked_wavenumbers", set())
+                                for i_lock in locked_w:
+                                    if 0 <= i_lock < n and i_lock < len(old_wn):
+                                        new_wn[i_lock] = float(old_wn[i_lock])
+                            st.session_state.matched_wavenumbers = new_wn
+
                         st.session_state.peak_rois = {}
                         roi_size = 100
                         for i, px in enumerate(st.session_state.matched_pixels):
@@ -332,18 +496,15 @@ if uploaded_file is not None:
                                 "max": min(int(px + roi_size), int(max(pixel_index))),
                             }
 
-                        # 適用フラグ
                         st.session_state.peaks_applied = True
-
-                        st.success(f"{len(st.session_state.matched_pixels)} 個のピークを反映しました。下に全体表示とROI調整が現れます。")
+                        st.success(f"{len(st.session_state.matched_pixels)} 個のピークを反映しました。")
                         st.rerun()
-
         # --------------------------------------------------
         # ここから下は「適用」後にのみ表示
         # --------------------------------------------------
         if st.session_state.get("peaks_applied", False) and st.session_state.get("matched_pixels"):
             # 全体スペクトル（適用済みのピークを表示）
-            st.header("📊 ピーク付き全体スペクトル")
+            st.header("ラマンスペクトル（Pixel）")
             fig_main = go.Figure()
             fig_main.add_trace(go.Scatter(x=pixel_index, y=spectrum_data, mode='lines',
                                           name='ラマンスペクトル', line=dict(color='lightblue', width=2)))
@@ -407,11 +568,9 @@ if uploaded_file is not None:
                             st.session_state.peak_rois[i]['min'] = new_roi_min
                             st.session_state.peak_rois[i]['max'] = new_roi_max
 
-                    # ---- 波数（cm⁻¹）：既定エタノールピークが初期値として入る ----
+                    # ---- 波数（cm⁻¹） ----
                     with col_wavenumber:
                         st.markdown("**波数:**")
-                        # ここで st.session_state.matched_wavenumbers[i] は上の適用時に
-                        # processor.default_ethanol_peaks の順番で設定済み
                         new_wavenumber = st.number_input(
                             "波数 (cm⁻¹)",
                             value=float(st.session_state.matched_wavenumbers[i]),
@@ -468,71 +627,199 @@ if uploaded_file is not None:
             peak_df = pd.DataFrame({
                 'ピーク': [f"ピーク {i+1}" for i in range(len(st.session_state.matched_pixels))],
                 'ピクセル位置': [f"{p:.1f}" for p in st.session_state.matched_pixels],
-                '波長 (nm)': [f"{processor.wavenumber_to_wavelength(wn):.2f}" for wn in st.session_state.matched_wavenumbers],
+                # '波長 (nm)': [f"{processor.wavenumber_to_wavelength(wn):.2f}" for wn in st.session_state.matched_wavenumbers],
                 '波数 (cm⁻¹)': st.session_state.matched_wavenumbers,
             })
             st.dataframe(peak_df, use_container_width=True)
 
             st.divider()
-            # キャリブレーション結果
-            if len(st.session_state.matched_pixels) >= 2:
-                st.header("📊 キャリブレーション結果")
-                matched_wavelengths = [processor.wavenumber_to_wavelength(wn) for wn in st.session_state.matched_wavenumbers]
-                coeffs, degree, fitting_results = processor.polynomial_fitting(st.session_state.matched_pixels, matched_wavelengths)
-                if coeffs is not None:
-                    col1, col2, col3 = st.columns(3)
-                    with col1: st.metric("レーザー波長", f"{laser_wavelength} nm")
-                    with col2: st.metric("ピーク数", len(st.session_state.matched_pixels))
-                    with col3: st.metric("多項式の次数", degree)
+            # ==========================================
+            # 📊 キャリブレーション結果（5次 + 摂動 + L2最小）
+            # ==========================================
+            st.header("キャリブレーション結果")
 
-                    coeff_col1, coeff_col2 = st.columns(2)
-                    with coeff_col1:
-                        st.subheader("多項式近似")
-                        fig_fit = go.Figure()
-                        fig_fit.add_trace(go.Scatter(x=st.session_state.matched_pixels, y=matched_wavelengths,
-                                                     mode='markers', name='ピーク位置', marker=dict(color='red', size=10)))
-                        x_fit = np.linspace(min(st.session_state.matched_pixels), max(st.session_state.matched_pixels), 1000)
-                        y_fit = np.polyval(coeffs, x_fit)
-                        fig_fit.add_trace(go.Scatter(x=x_fit, y=y_fit, mode='lines',
-                                                     name=f'{degree} 次近似', line=dict(color='blue', width=2)))
-                        fig_fit.update_layout(title=f"多項式近似（次数 {degree}）",
-                                              xaxis_title="ピクセル位置", yaxis_title="波長 (nm)", height=400, showlegend=True)
-                        st.plotly_chart(fig_fit, use_container_width=True)
-                    with coeff_col2:
-                        st.subheader("多項式係数")
-                        coeffs_df = pd.DataFrame([{'係数': f'B_{i}','値': f'{c:.6e}','説明': f'x^{i}' if i>0 else '定数項'}
-                                                  for i, c in enumerate(coeffs[::-1])])
-                        st.write(coeffs_df)
-                        st.write("**多項式の式:**")
-                        equation = " + ".join([f"{c:.3e}" if i==0 else (f"{c:.3e}x" if i==1 else f"{c:.3e}x^{i}")
-                                               for i, c in enumerate(coeffs[::-1])])
-                        st.code(f"y = {equation}", language='python')
+            col_cfg1, col_cfg2, col_cfg3, col_cfg4 = st.columns(4)
+            with col_cfg1:
+                tol_cm1 = st.number_input("許容最大誤差 (cm⁻¹)", min_value=0.1, max_value=10.0, value=2.0, step=0.1)
+            with col_cfg2:
+                max_jitter_px = st.number_input("最大ピクセル摂動 (±px)", min_value=0, max_value=10, value=2, step=1)
+            with col_cfg3:
+                max_iter = st.number_input("最大反復回数", min_value=1, max_value=200, value=25, step=1)
+            with col_cfg4:
+                degree = st.number_input("多項式次数", min_value=1, max_value=5, value=5, step=1)
 
-                    st.subheader("多項式近似によるピクセル対波数")
-                    x_values = processor.pixel_indexs
-                    y_values = np.polyval(coeffs, x_values)
-                    fig_pixel_vs_wn = go.Figure()
-                    fig_pixel_vs_wn.add_trace(go.Scatter(x=x_values, y=y_values, mode='lines',
-                                                         name='ピクセル対波数', line=dict(color='purple', width=2)))
-                    fig_pixel_vs_wn.update_layout(title="ピクセル位置 vs 波数",
-                                                  xaxis_title="ピクセル位置", yaxis_title="波数 (cm⁻¹)", height=400, showlegend=True)
-                    st.plotly_chart(fig_pixel_vs_wn, use_container_width=True)
+            # 5次（またはデータ数に応じて下げる）+摂動 で SSE(cm^-1) を最小化
+            coeffs_poly, metrics, calc_cm1 = fit_poly_with_jitter_cm1(
+                processor,
+                st.session_state.matched_pixels,
+                st.session_state.matched_wavenumbers,
+                degree=int(degree),
+                tol_cm1=float(tol_cm1),
+                max_jitter_px=int(max_jitter_px),
+                max_iter=int(max_iter),
+                subpixel=False  # 必要なら True
+            )
+            MAX_DEGREE = 5
+            coeffs_poly_padded = coeffs_poly
+            if len(coeffs_poly) < (MAX_DEGREE + 1):  # np.polyfitは高次→低次の順
+                pad = np.zeros((MAX_DEGREE + 1) - len(coeffs_poly))
+                # 高次側（先頭）に0を付与して5次化
+                coeffs_poly_padded = np.concatenate([pad, coeffs_poly])
+            # メトリクス表示
+            m1, m2, m3, m4, m5 = st.columns(5)
+            with m1: st.metric("収束", "✅" if metrics["converged"] else "❌")
+            with m2: st.metric("反復", f"{metrics['iterations']}")
+            with m3: st.metric("RMSE (cm⁻¹)", f"{metrics['rmse']:.3f}")
+            with m4: st.metric("最大|誤差| (cm⁻¹)", f"{metrics['max_abs']:.3f}")
+            with m5: st.metric("SSE (二乗和)", f"{metrics['sse']:.3f}")
 
-                    st.subheader("🚀 結果のエクスポート")
-                    formatted_coeffs = [f'"{coeff:.7E}"' for coeff in coeffs[::-1]]
-                    server_format = f"'b_coeff': [{', '.join(formatted_coeffs)}],\n'laser_wavelength': {laser_wavelength},\n'degree': {degree}"
-                    st.code(server_format, language='python')
-                    results_text = f"Laser wavelength: {laser_wavelength} nm\nPolynomial degree: {degree}\nNumber of peaks: {len(st.session_state.matched_pixels)}\n\nPeak matching results:\n"
-                    for i, (pixel, wavenumber) in enumerate(zip(st.session_state.matched_pixels, st.session_state.matched_wavenumbers)):
-                        wavelength = processor.wavenumber_to_wavelength(wavenumber)
-                        results_text += f"Peak {i+1}: pixel={pixel:.1f}, wavenumber={wavenumber}, wavelength={wavelength:.2f}\n"
-                    results_text += "\nPolynomial coefficients:\n"
-                    for i, coeff in enumerate(coeffs[::-1]):
-                        results_text += f"B_{i} = {coeff:.10e}\n"
-                    st.download_button(label="📥 キャリブレーション結果をダウンロード",
-                                       data=results_text,
-                                       file_name=f"calibration_results_{laser_wavelength}nm.txt",
-                                       mime="text/plain")
+            # 係数表示
+            
+            # 指定 vs 計算（cm^-1）
+            # st.subheader("指定波数 vs 計算波数（誤差一覧）")
+            target_cm1 = np.array(st.session_state.matched_wavenumbers, dtype=float)
+            err = calc_cm1 - target_cm1
+            abs_err = np.abs(err)
+            sq_err = err**2
+
+            # peak_table = pd.DataFrame({
+            #     "ピーク": [f"ピーク {i+1}" for i in range(len(target_cm1))],
+            #     "ピクセル": [int(p) for p in metrics["pixels"]],
+            #     "指定 波数(cm⁻¹)": target_cm1,
+            #     "計算 波数(cm⁻¹)": calc_cm1,
+            #     "差(計算-指定)": err,
+            #     "絶対誤差 |cm⁻¹|": abs_err,
+            #     "二乗誤差 (cm⁻²)": sq_err
+            # })
+            # st.dataframe(
+            #     peak_table.style.format({
+            #         "指定 波数(cm⁻¹)": "{:.3f}",
+            #         "計算 波数(cm⁻¹)": "{:.3f}",
+            #         "差(計算-指定)": "{:.3f}",
+            #         "絶対誤差 |cm⁻¹|": "{:.3f}",
+            #         "二乗誤差 (cm⁻²)": "{:.3f}",
+            #     }),
+            #     use_container_width=True
+            # )
+
+            # 要約表（絶対値合計・二乗和・MAE・RMSE など）
+            # st.subheader("誤差サマリー（表）")
+            # mae = float(np.mean(abs_err))
+            # sse = float(np.sum(sq_err))  # == metrics["sse"]
+            # l1_sum = float(np.sum(abs_err))
+            # summary_df = pd.DataFrame({
+            #     "指標": ["合計絶対誤差 (L1)", "二乗和 (SSE)", "MAE (平均絶対誤差)", "RMSE", "最大|誤差|"],
+            #     "値": [l1_sum, sse, mae, float(metrics["rmse"]), float(metrics["max_abs"])]
+            # })
+            # st.table(summary_df.style.format({"値": "{:.6f}"}))
+
+            # 誤差プロット（折れ線）
+            st.subheader("誤差プロット（cm⁻¹）")
+            fig_err = go.Figure()
+            fig_err.add_trace(go.Scatter(
+                x=list(range(1, len(target_cm1)+1)),
+                y=err,
+                mode="lines+markers",
+                name="差(計算-指定)"
+            ))
+            fig_err.add_hline(y=float(tol_cm1), line_dash="dash", line_color="red", opacity=0.6)
+            fig_err.add_hline(y=-float(tol_cm1), line_dash="dash", line_color="red", opacity=0.6)
+            fig_err.update_layout(
+                xaxis_title="ピーク番号",
+                yaxis_title="誤差 (cm⁻¹)",
+                height=360,
+                showlegend=False
+            )
+            st.plotly_chart(fig_err, use_container_width=True)
+
+            # 追加：絶対値と二乗和 を表すグラフ（バー）
+            # st.subheader("絶対誤差・二乗誤差（バーグラフ）")
+            # c1, c2 = st.columns(2)
+            # with c1:
+            #     fig_abs = go.Figure()
+            #     fig_abs.add_trace(go.Bar(
+            #         x=[f"#{i+1}" for i in range(len(abs_err))],
+            #         y=abs_err,
+            #         name="絶対誤差 |cm⁻¹|"
+            #     ))
+            #     fig_abs.add_hline(y=float(tol_cm1), line_dash="dash", line_color="red", opacity=0.6)
+            #     fig_abs.update_layout(
+            #         xaxis_title="ピーク番号",
+            #         yaxis_title="|誤差| (cm⁻¹)",
+            #         height=350,
+            #         showlegend=False
+            #     )
+            #     st.plotly_chart(fig_abs, use_container_width=True)
+            # with c2:
+            #     fig_sq = go.Figure()
+            #     fig_sq.add_trace(go.Bar(
+            #         x=[f"#{i+1}" for i in range(len(sq_err))],
+            #         y=sq_err,
+            #         name="二乗誤差 (cm⁻²)"
+            #     ))
+            #     fig_sq.update_layout(
+            #         xaxis_title="ピーク番号",
+            #         yaxis_title="誤差² (cm⁻²)",
+            #         height=350,
+            #         showlegend=False
+            #     )
+            #     st.plotly_chart(fig_sq, use_container_width=True)
+
+            st.subheader("多項式近似（pixel→wavenumber）カーブ")
+            poly = coeffs_poly_padded if 'coeffs_poly_padded' in locals() else coeffs_poly
+            x_fit = np.linspace(min(metrics["pixels"]), max(metrics["pixels"]), 1000)
+            y_fit_wl = np.polyval(poly, x_fit)
+            y_fit_cm1 = _wl_to_cm1_float(processor.laser_wavelength, y_fit_wl)
+            y_pts_wl = np.polyval(poly, metrics["pixels"])
+            y_pts_cm1 = _wl_to_cm1_float(processor.laser_wavelength, y_pts_wl)
+            fig_fit = go.Figure()
+            fig_fit.add_trace(go.Scatter(x=metrics["pixels"], y=y_pts_cm1,
+                                        mode="markers", name="採用ピーク(波数)"))
+            fig_fit.add_trace(go.Scatter(x=x_fit, y=y_fit_cm1, mode="lines", name=f"{degree}次近似"))
+            fig_fit.update_layout(xaxis_title="pixel", yaxis_title="wavenumber (cm⁻¹)", height=380)
+            st.plotly_chart(fig_fit, use_container_width=True)
+
+            # 参考：pixel→wavelength カーブ
+            with st.expander("多項式近似（pixel→wavelength）カーブを表示", expanded=False):
+                # st.subheader("多項式近似（pixel→wavelength）カーブ")
+                x_fit = np.linspace(min(metrics["pixels"]), max(metrics["pixels"]), 1000)
+                y_fit = np.polyval(coeffs_poly_padded, x_fit)  # ← 差し替え
+                fig_fit = go.Figure()
+                fig_fit.add_trace(go.Scatter(x=metrics["pixels"], y=np.polyval(coeffs_poly_padded, metrics["pixels"]),  # ← 差し替え
+                                            mode="markers", name="採用ピーク(波長)"))
+                fig_fit.add_trace(go.Scatter(x=x_fit, y=y_fit, mode="lines", name=f"{degree}次近似"))
+
+                fig_fit.update_layout(xaxis_title="pixel", yaxis_title="wavelength (nm)", height=380)
+                st.plotly_chart(fig_fit, use_container_width=True)
+
+            # エクスポート
+            st.subheader("結果のエクスポート")
+            formatted_coeffs = [f'"{coeff:.7E}"' for coeff in coeffs_poly_padded[::-1]]  # ← 差し替え（B_0..B_5想定）
+            server_format = f"'b_coeff': [{', '.join(formatted_coeffs)}],\n'laser_wavelength': {processor.laser_wavelength},\n'degree': {int(degree)}"
+            st.code(server_format, language='python')
+
+            lines = []
+            lines.append(f"Laser wavelength: {processor.laser_wavelength} nm")
+            lines.append(f"Degree: {int(degree)}")
+            lines.append(f"Converged: {metrics['converged']}")
+            lines.append(f"Iterations: {metrics['iterations']}")
+            lines.append(f"RMSE(cm^-1): {metrics['rmse']:.6f}")
+            lines.append(f"MaxAbs(cm^-1): {metrics['max_abs']:.6f}")
+            lines.append(f"SSE(cm^-1^2): {metrics['sse']:.6f}")
+            # lines.append(f"L1 Sum(cm^-1): {l1_sum:.6f}")
+            # lines.append(f"MAE(cm^-1): {mae:.6f}\n")
+            lines.append("Peaks:")
+            for i, (px, tgt, est, e, ae, se) in enumerate(zip(metrics["pixels"], target_cm1, calc_cm1, err, abs_err, sq_err), 1):
+                lines.append(f"  Peak {i}: pixel={px:.2f}, target={tgt:.3f}, calc={est:.3f}, diff={e:.3f}, |diff|={ae:.3f}, diff^2={se:.3f}")
+            lines.append("\nCoeffs (B_0..B_n on wavelength):")
+            for i, c in enumerate(coeffs_poly_padded[::-1]):  # ← 差し替え
+                lines.append(f"B_{i} = {c:.10e}")
+            st.download_button(
+                "📥 フィット結果をダウンロード",
+                data="\n".join(lines),
+                file_name=f"poly{int(degree)}_jitter_fit_{processor.laser_wavelength}nm.txt",
+                mime="text/plain"
+            )
 
 else:
     st.info("👆 キャリブレーションを開始するにはCSVファイルをアップロードしてください")
